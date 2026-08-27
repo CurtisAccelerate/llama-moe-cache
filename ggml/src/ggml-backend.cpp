@@ -12,6 +12,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-moe-cache.h"
+
+struct ggml_moe_cache_api ggml_moe_cache = {};
 
 #include <assert.h>
 #include <limits.h>
@@ -107,6 +110,13 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
 void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
+    }
+
+    if (ggml_moe_cache.invalidate && buffer->iface.get_base && ggml_backend_buffer_is_host(buffer)) {
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (base) {
+            ggml_moe_cache.invalidate(base, ggml_backend_buffer_get_size(buffer));
+        }
     }
 
     if (buffer->iface.free_buffer != NULL) {
@@ -1724,6 +1734,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    if (ggml_moe_cache.redirect_finalize &&
+                        ggml_moe_cache.redirect_finalize(input->data, split_backend)) {
+                        continue;
+                    }
+
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1734,6 +1749,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    }
+                }
+            }
+        }
+
+        if (ggml_moe_cache.redirect_offer && sched->n_copies == 1 &&
+            split->graph.n_nodes > 0 &&
+            split_backend_id == sched->n_backends - 1) {
+            ggml_tensor * last = split->graph.nodes[split->graph.n_nodes - 1];
+            if (last->op == GGML_OP_MUL_MAT_ID && !(last->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                int consumer_split = -1;
+                int n_consumers = 0;
+                for (int j = split_id + 1; j < sched->n_splits && n_consumers < 2; ++j) {
+                    for (int k = 0; k < splits[j].n_inputs; ++k) {
+                        if (splits[j].inputs[k] == last) {
+                            ++n_consumers;
+                            consumer_split = j;
+                            break;
+                        }
+                    }
+                }
+                if (n_consumers == 1) {
+                    const int consumer_backend_id = splits[consumer_split].backend_id;
+                    ggml_backend_t consumer_backend = sched->backends[consumer_backend_id];
+                    ggml_tensor * cpy = tensor_copy(last, consumer_backend_id, sched->cur_copy);
+                    if (cpy && cpy->data && consumer_backend_id != sched->n_backends - 1 && ggml_is_contiguous(last)) {
+                        ggml_moe_cache.redirect_offer(last->data, last->nb[1],
+                                                      last->ne[1] * last->ne[2],
+                                                      cpy->data, consumer_backend);
                     }
                 }
             }

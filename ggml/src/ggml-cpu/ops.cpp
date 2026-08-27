@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "../ggml-backend-moe-cache.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -2919,6 +2920,20 @@ static void ggml_compute_forward_reglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
+    unsigned long long moe_cache_skip = 0;
+    uint64_t moe_cache_skip_w[8] = {};
+    int moe_cache_skip_wide = 0;
+    if (src1 && ggml_moe_cache.glu_hits_w && nr <= 512) {
+        moe_cache_skip_wide = ggml_moe_cache.glu_hits_w(src0->data, src1->data,
+                                                       dst->data, dst->nb[1], ith,
+                                                       moe_cache_skip_w, 8);
+    } else if (src1 && ggml_moe_cache.glu_hits && nr <= 64) {
+        moe_cache_skip = ggml_moe_cache.glu_hits(src0->data, src1->data,
+                                                 dst->data, dst->nb[1], ith);
+        moe_cache_skip_w[0] = (uint64_t) moe_cache_skip;
+        moe_cache_skip_wide = moe_cache_skip != 0;
+    }
+
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
 
@@ -2927,6 +2942,10 @@ static void ggml_compute_forward_reglu_f32(
     const int ir1 = MIN(ir0 + dr, nr);
 
     for (int i1 = ir0; i1 < ir1; i1++) {
+        if (moe_cache_skip_wide && i1 < 512 &&
+                (moe_cache_skip_w[i1 / 64] & (1ull << (i1 % 64)))) {
+            continue;
+        }
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 

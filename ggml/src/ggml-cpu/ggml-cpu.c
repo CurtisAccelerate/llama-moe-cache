@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "../ggml-backend-moe-cache.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1565,6 +1566,17 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // Dynamic MoE expert cache state. Thread 0 plans and launches cached rows;
+    // CPU workers compute only misses, then thread 0 collects cached results.
+    enum { MOE_CACHE_MAX_TOPK = 512 };
+    int           moe_cache_dev = -1;
+    int64_t       moe_cache_t0 = 0;
+    int           moe_cache_n_hits = 0;
+    int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
+    const float * moe_cache_acts[MOE_CACHE_MAX_TOPK];
+    float *       moe_cache_rows[MOE_CACHE_MAX_TOPK];
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1620,6 +1632,29 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        if (ggml_moe_cache.begin && src1->type == GGML_TYPE_F32 &&
+            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+            moe_cache_t0 = ggml_time_us();
+            moe_cache_dev = ggml_moe_cache.begin(src0->name, src0->data, nb02,
+                                                 ne00, ne01, (int) type, ne02, ids->ne[1]);
+            if (moe_cache_dev >= 0) {
+                int32_t moe_cache_ids[MOE_CACHE_MAX_TOPK];
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        int32_t cid = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        moe_cache_ids[iid1*n_ids + id] = (cid >= 0 && cid < n_as) ? cid : -1;
+                    }
+                }
+                ggml_moe_cache.plan(moe_cache_dev, moe_cache_ids,
+                                    (int) (n_ids * ids->ne[1]), moe_cache_slot_idx);
+                for (int64_t s = 0; s < n_ids * ids->ne[1]; ++s) {
+                    if (moe_cache_ids[s] < 0) {
+                        moe_cache_slot_idx[s] = -1;
+                    }
+                }
+            }
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1628,13 +1663,33 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0 || i02 >= n_as) {
+                    float * dst_row = (float *)((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2]);
+                    memset(dst_row, 0, dst->ne[0]*sizeof(float));
+                    continue;
+                }
+
+                if (moe_cache_dev >= 0 && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
+                    const int64_t i11 = id % ne11;
+                    moe_cache_compact[moe_cache_n_hits] = moe_cache_slot_idx[iid1*n_ids + id];
+                    moe_cache_acts[moe_cache_n_hits] = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
+                    moe_cache_rows[moe_cache_n_hits] = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
+                    moe_cache_n_hits++;
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (moe_cache_dev >= 0 && moe_cache_n_hits > 0) {
+            ggml_moe_cache.dispatch(moe_cache_dev, (int) type, ne00, ne01,
+                                    moe_cache_n_hits, moe_cache_compact, moe_cache_acts);
+        }
     }
+
+    const int64_t moe_cache_miss_t0 = ith == 0 && moe_cache_dev >= 0 ? ggml_time_us() : 0;
 
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
@@ -1703,6 +1758,16 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+
+    if (ith == 0 && moe_cache_dev >= 0 && ggml_moe_cache.miss_time) {
+        ggml_moe_cache.miss_time(moe_cache_dev, ggml_time_us() - moe_cache_miss_t0);
+    }
+    if (moe_cache_dev >= 0 && moe_cache_n_hits > 0) {
+        ggml_moe_cache.collect(moe_cache_dev, moe_cache_n_hits, moe_cache_rows, ne0);
+    }
+    if (ith == 0 && ggml_moe_cache.node_time && (moe_cache_dev >= 0 || moe_cache_dev == -3)) {
+        ggml_moe_cache.node_time(moe_cache_dev, ggml_time_us() - moe_cache_t0);
     }
 }
 

@@ -1,4 +1,14 @@
-# llama.cpp
+# llama-moe-cache: experimental CUDA MoE cache fork
+
+An independent llama.cpp fork for large GGUF MoE models that spill beyond VRAM. Cached experts run on CUDA while CPU workers compute misses; selected hot experts can be restored after restart. The cache is **off unless enabled**.
+
+**Credit:** the hybrid demand-cache core, async inserts, LRU, fusion and original hotset mechanism come from [leloch's cache work](https://github.com/ggml-org/llama.cpp/pull/24524). Our extensions include 512-expert hotsets, ranked/decayed capacity-aware restore, hot-only loading, Windows fixes and a reproducible Qwen placement preset. Qwen architecture support is ported from [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742). This is not an official llama.cpp release or an upstream PR.
+
+Start with [build, launch, provenance and limitations](docs/moe-cache-fork.md). Windows users can use [the portable launcher](scripts/start-moe-cache.ps1). No weights, private benchmarks, binaries or LAN deployment scripts are bundled.
+
+Historical Qwen Flash Next Q4 measurements on one RTX 5090 + 64 GiB RAM reached roughly **23-30 tok/s warmed**, depending on workload. These are development-build observations, not a guarantee or a fresh benchmark of this extracted release. Speculative peak numbers are deliberately excluded. Always compare cache on/off on your hardware.
+
+## Upstream llama.cpp documentation
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
