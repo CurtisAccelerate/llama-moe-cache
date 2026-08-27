@@ -8,6 +8,25 @@ Start with [build, launch, provenance and limitations](docs/moe-cache-fork.md). 
 
 Historical Qwen Flash Next Q4 measurements on one RTX 5090 + 64 GiB RAM reached roughly **23-30 tok/s warmed**, depending on workload. These are development-build observations, not a guarantee or a fresh benchmark of this extracted release. Speculative peak numbers are deliberately excluded. Always compare cache on/off on your hardware.
 
+## Technical note: what is being accelerated?
+
+This is **hybrid expert execution**, not an attempt to fit the entire model into VRAM. Ordinary llama.cpp placement still handles attention and resident expert layers. For eligible CPU-resident expert tensors, the cache intercepts `mul_mat_id` and splits the selected work:
+
+```text
+Selected experts -> resident cache hits -> CUDA compute --+
+                 -> cache misses        -> CPU compute ---+-> join results
+                                           |
+                                           +-> admit selected weights to VRAM for later reuse
+```
+
+CUDA hit computation can overlap CPU miss computation. Background workers stage admitted weights through pinned host buffers and copy them over local PCIe; the current miss does not wait for its cache insertion. Execution still waits for the required expert results. File-backed misses can still fault from SSD: mmap, system RAM and VRAM remain distinct resources. This release is single-machine, not the earlier LAN-serving experiment.
+
+Our hotset extensions build on leloch's cache: track decaying per-expert access scores, support 512 experts per block, select restart entries within each pool's actual capacity, and restore only that ranked set instead of sweeping the whole expert bank. The saved file contains **ranking metadata, not weights or chat/KV state**. Once restored, entries remain evictable under LRU; this is not permanent pinning.
+
+The Qwen preset combines 35 CPU-MoE layers with a 3600 MiB dynamic cache, GPU-resident remaining expert layers, 32K context and one request slot. MTP and DFlash are off. The intended benefit is less repeated CPU expert work and fewer cold weight accesses, not more model capacity without cost.
+
+**Limits:** routing and expert weights are not deliberately changed, but CPU/CUDA arithmetic can differ; bit-exact output versus cache-off is not guaranteed. Warm short-prompt speeds are not cold-start, long-context or quality results. The extracted release passed its CUDA build and launcher checks, but has not had a new full-model performance/quality evaluation. See [methods, settings and attribution](docs/moe-cache-fork.md) before treating the historical numbers as a comparison with upstream.
+
 ## Upstream llama.cpp documentation
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
