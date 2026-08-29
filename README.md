@@ -1,3 +1,12 @@
+# Experimental performance branches
+
+This fork carries two separate, default-off large-MoE experiments:
+
+- [`qwen-moe-cache`](https://github.com/CurtisAccelerate/llama-moe-cache/tree/qwen-moe-cache): CUDA demand cache and hotset restore for Qwen/other spilling GGUF MoE models.
+- [`glm53-mrow`](https://github.com/CurtisAccelerate/llama-moe-cache/tree/glm53-mrow): exact M=2 CPU expert kernels and GLM-5.3-Flash serving preset for Arrow Lake + RTX 5090.
+
+The GLM branch improved a matched, fully warm two-prompt mean from **17.11 to 19.29 tok/s (+12.8%)** with identical token arrays. See [the technical note](docs/glm53-mrow.md) and [portable PowerShell launcher](scripts/start-glm53-mrow.ps1). These are independent research branches, not an official llama.cpp release or upstream PR.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "moe-mrow-vnni.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1455,11 +1456,6 @@ UseGgmlGemm2:;
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1644,6 +1640,42 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    const int mrow_want = ggml_moe_mrow_vnni_get() && ggml_moe_mrow_vnni_supported(src0->type);
+    int mrow_on = 0;
+    if (mrow_want) {
+        int64_t max_m = 0;
+        for (int a = 0; a < n_as; ++a) {
+            if (matrix_row_counts[a] > max_m) {
+                max_m = matrix_row_counts[a];
+            }
+        }
+        mrow_on = max_m >= ggml_moe_mrow_vnni_min_m();
+        if (!mrow_on && ith == 0) {
+            ggml_moe_mrow_vnni_note_stock(matrix_row_counts, n_as);
+        }
+    }
+
+    if (mrow_on && ggml_moe_mrow_vnni_dynamic_get()) {
+        // Let fast P-cores steal output tiles immediately rather than reserving
+        // a slab for every P/E worker on hybrid Arrow Lake CPUs.
+        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+            atomic_store_explicit(current_chunk_ctr, 0, memory_order_relaxed);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    if (mrow_on) {
+        ggml_moe_mrow_vnni_apply(
+            params, dst, (const char *) src0->data, src0->type,
+            ne00, ne01, ne11, nb01, nb02, nb1, nb2, nb11, nb12,
+            n_as, n_ids, (int) ids->ne[1],
+            matrix_row_counts, matrix_rows, src1_cont, vec_dot_type, wdata,
+            atomic_current_chunk, CACHE_LINE_SIZE);
+        return;
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1652,7 +1684,6 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         const int64_t nr0 = ne01;

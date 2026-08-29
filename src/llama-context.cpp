@@ -15,6 +15,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -102,6 +103,21 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    if (model.arch == LLM_ARCH_GLM5NEXT && cparams.n_rs_seq > 0) {
+        // GLM5Next supports bounded recurrent rollback. A small cap avoids
+        // snapshotting the entire speculative block while retaining exact
+        // rollback for the configured window. Default behavior is unchanged.
+        uint32_t cap = 0;
+        if (const char * value = std::getenv("LLAMA_GLM53_RS_ROLLBACK_CAP")) {
+            char * end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0') {
+                cap = (uint32_t) std::min<unsigned long>(parsed, cparams.n_rs_seq);
+            }
+        }
+        cparams.n_rs_seq = cap;
+        LLAMA_LOG_INFO("%s: GLM5Next recurrent rollback cap = %u\n", __func__, cparams.n_rs_seq);
+    }
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);

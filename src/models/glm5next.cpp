@@ -4,6 +4,8 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 //
@@ -325,6 +327,31 @@ static ggml_tensor * glm5next_view_2d(ggml_context * ctx, ggml_tensor * t, int64
     return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], ggml_row_size(t->type, i0));
 }
 
+// Exact multi-row verifier mode. CUDA can select a different reduction shape
+// for N=2..8 than sequential N=1 decode. This default-off path preserves the
+// sequential KDA projection shape without changing the surrounding graph.
+static bool glm5next_exact_kda_rows_enabled() {
+    const char * value = std::getenv("LLAMA_GLM53_EXACT_KDA_ROWS");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static ggml_tensor * glm5next_mul_mat_token_rows(
+        ggml_context * ctx, ggml_tensor * weights, ggml_tensor * input) {
+    if (!glm5next_exact_kda_rows_enabled() || input->ne[1] <= 1 || input->ne[1] > 8) {
+        return ggml_mul_mat(ctx, weights, input);
+    }
+
+    GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
+    ggml_tensor * result = nullptr;
+    for (int64_t token = 0; token < input->ne[1]; ++token) {
+        ggml_tensor * column = ggml_view_2d(
+                ctx, input, input->ne[0], 1, input->nb[1], token * input->nb[1]);
+        ggml_tensor * projected = ggml_mul_mat(ctx, weights, column);
+        result = result == nullptr ? projected : ggml_concat(ctx, result, projected, 1);
+    }
+    return result;
+}
+
 static ggml_tensor * glm5next_hc_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * scale, ggml_tensor * base) {
     return ggml_add(ctx, ggml_mul(ctx, x, scale), base);
 }
@@ -517,7 +544,7 @@ static ggml_tensor * glm5next_causal_conv1d(
             total_state_size * ggml_element_size(conv_state_all),
             qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
+    ggml_tensor * x_proj = glm5next_mul_mat_token_rows(ctx0, proj_w, x);
     x_proj = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
 
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
@@ -573,8 +600,8 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     // forget gate: g = gate_lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias)).
     // ssm_a holds -exp(A_log), so exp(A_log)*(...) == -(ssm_a*(...)).
-    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-    g = ggml_mul_mat(ctx0, layer.ssm_f_b, g);
+    ggml_tensor * g = glm5next_mul_mat_token_rows(ctx0, layer.ssm_f_a, cur);
+    g = glm5next_mul_mat_token_rows(ctx0, layer.ssm_f_b, g);
     g = ggml_add(ctx0, g, layer.ssm_dt_b);
     g = ggml_reshape_3d(ctx0, g, head_dim, n_head_kda, n_tokens);
     g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1));
@@ -583,7 +610,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     g = ggml_reshape_4d(ctx0, g, head_dim, n_head_kda, n_seq_tokens, n_seqs);
     cb(g, "kda_gate", il);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    ggml_tensor * beta = glm5next_mul_mat_token_rows(ctx0, layer.ssm_beta, cur);
     beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs));
     cb(beta, "kda_beta", il);
 
@@ -600,8 +627,8 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
             inp_rs, ssm_states_all, q, k, v, g, beta, state, il));
 
     // Glm5NextTextRMSNormGated: RMSNorm first, then a SIGMOID gate (not SiLU)
-    ggml_tensor * o_gate = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
-    o_gate = ggml_mul_mat(ctx0, layer.ssm_g_b, o_gate);
+    ggml_tensor * o_gate = glm5next_mul_mat_token_rows(ctx0, layer.ssm_g_a, cur);
+    o_gate = glm5next_mul_mat_token_rows(ctx0, layer.ssm_g_b, o_gate);
     o_gate = ggml_reshape_3d(ctx0, o_gate, head_dim, n_head_kda, n_tokens);
 
     out = ggml_reshape_3d(ctx0, out, head_dim, n_head_kda, n_tokens);
@@ -609,7 +636,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, o_gate));
     cb(out, "kda_normed_gated", il);
 
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, out, d_inner, n_tokens));
+    cur = glm5next_mul_mat_token_rows(ctx0, layer.wo, ggml_cont_2d(ctx0, out, d_inner, n_tokens));
     cb(cur, "kda_out", il);
 
     return cur;
@@ -940,6 +967,14 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
+        // Expose the same pre-layer mean-collapsed target feature consumed by
+        // the official GLM DFlash sidecar, only for requested layer ids.
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = glm5next_hc_mean(ctx0, inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;

@@ -319,6 +319,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    llama_build_and_test(test-moe-mrow-vnni.cpp)
 endif()
 
 # libmtmd

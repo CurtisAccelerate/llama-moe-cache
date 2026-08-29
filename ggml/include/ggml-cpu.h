@@ -147,6 +147,27 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    // Default-off expert-major M-row path (LLAMA_MOE_MROW_VNNI=1).
+    // Reuses decoded IQ2_XXS / IQ3_XXS weights when two activation rows select
+    // the same expert. M=1 and unsupported shapes retain stock MUL_MAT_ID.
+    GGML_BACKEND_API void ggml_moe_mrow_vnni_set(int enabled);
+    GGML_BACKEND_API int  ggml_moe_mrow_vnni_get(void);
+    GGML_BACKEND_API void ggml_moe_mrow_vnni_dynamic_set(int enabled);
+    GGML_BACKEND_API int  ggml_moe_mrow_vnni_dynamic_get(void);
+    GGML_BACKEND_API int  ggml_moe_mrow_vnni_supported(enum ggml_type wtype);
+    GGML_BACKEND_API int  ggml_moe_mrow_vnni_uses_vpdpbusd(void);
+    GGML_BACKEND_API const char * ggml_moe_mrow_vnni_kernel_name(void);
+    GGML_BACKEND_API int  ggml_moe_mrow_vnni_min_m(void);
+
+    struct ggml_moe_mrow_vnni_counters {
+        uint64_t hit[9];
+        uint64_t fallback[9];
+        uint64_t ops_kernel;
+        uint64_t ops_stock;
+    };
+    GGML_BACKEND_API void ggml_moe_mrow_vnni_counters_reset(void);
+    GGML_BACKEND_API void ggml_moe_mrow_vnni_counters_get(struct ggml_moe_mrow_vnni_counters * out);
+
 #ifdef __cplusplus
 }
 #endif

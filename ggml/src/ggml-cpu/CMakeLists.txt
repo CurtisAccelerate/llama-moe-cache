@@ -52,10 +52,21 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/moe-mrow-vnni.c
+        ggml-cpu/moe-mrow-vnni.h
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+
+    # Arrow Lake exposes 256-bit AVX-VNNI but not AVX-512. Keep the stock
+    # backend build unchanged and opt this translation unit into vpdpbusd.
+    if (MSVC)
+        set_source_files_properties(
+            ggml-cpu/moe-mrow-vnni.c
+            PROPERTIES
+            COMPILE_DEFINITIONS "__AVXVNNI__;GGML_AVX_VNNI;__BMI2__;GGML_BMI2")
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
